@@ -69,7 +69,6 @@ use time::{now_utc, Timespec};
 use std::{fmt, mem, time};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use common::rollouts::ROLLOUTS;
 use peer;
 
 use rotator::RoundStage;
@@ -120,8 +119,6 @@ pub enum Command {
     /// Same as `StatusBlocksigner`, but with information the watchmen
     /// must agree on.
     StatusWatchman,
-    /// An ACK to the Status message, used to confirm network connectivity
-    StatusAck,
     /// An unsigned sidechain block (from master to peer)
     UnsignedBlock,
     /// A pre-commit to sign a block
@@ -144,16 +141,12 @@ pub enum Command {
 impl Command {
     /// Output a text representation of the command, for logging
     pub fn text(&self) -> &'static str {
-        // Remove the StatusAck command when cleaning up this rollout.
-        let _ = common::rollouts::StatusAckElim::Phase3;
-
         match *self {
             Command::Nack => "nack",
             Command::StatusBlocksignerPreSeen => "status_blocksigner_pre_seen",
             Command::StatusBlocksigner => "status_blocksigner",
             Command::StatusWatchmanPreSeen => "status_watchman_pre_seen",
             Command::StatusWatchman => "status_watchman",
-            Command::StatusAck => "status_ack",
             Command::UnsignedBlock => "unsigned_block",
             Command::BlockPrecommit => "block_precommit",
             Command::BlockSignature => "block_signature",
@@ -170,7 +163,6 @@ impl NetEncodable for Command {
     fn encode<W: Write>(&self, mut w: W) -> Result<usize, Error> {
         let bytes = match *self {
             Command::Nack => [0, 0, 0, 0],
-            Command::StatusAck => [0, 0, 0, 1],
             Command::StatusBlocksignerPreSeen => [0, 0, 0, 2],
             Command::StatusWatchmanPreSeen => [0, 0, 0, 3],
             Command::StatusBlocksigner => [0, 0, 0, 4],
@@ -194,7 +186,6 @@ impl NetEncodable for Command {
         r.read_exact(&mut sl[..])?;
         let command = match (sl[0], sl[1], sl[2], sl[3]) {
             (0, 0, 0, 0) => Command::Nack,
-            (0, 0, 0, 1) => Command::StatusAck,
             (0, 0, 0, 2) => Command::StatusBlocksignerPreSeen,
             (0, 0, 0, 3) => Command::StatusWatchmanPreSeen,
             (0, 0, 0, 4) => Command::StatusBlocksigner,
@@ -322,8 +313,9 @@ pub struct Header<S> {
     pub version: u32,
     /// ID of the sender
     pub sender: peer::Id,
-    /// ID of the receiver
-    pub receiver: peer::Id,
+    /// A deprecated field that is no longer used but kept here for potential future
+    /// reuse
+    pub _unused_field_1: peer::Id,
     /// Round number the message was sent in
     pub round: u32,
     /// ID of this message within a round (must increment by exactly
@@ -357,7 +349,7 @@ impl Into<logs::functionary::network::Header> for Header<secp256k1::ecdsa::Signa
         logs::functionary::network::Header {
             version: self.version,
             sender: self.sender.to_string(),
-            receiver: self.receiver.to_string(),
+            _unused_field_1: self._unused_field_1.to_string(),
             round: self.round,
             msgid: self.msgid,
             nonce: self.nonce,
@@ -377,9 +369,9 @@ impl<S> Header<S> {
         len += self.version.encode(&mut w)?;
         len += self.sender.encode(&mut w)?;
 
-        // read rollouts docs for comment on receiver field
-        let _ = common::rollouts::Broadcast::Phase3;
-        len += self.receiver.encode(&mut w)?;
+        // field is unused but we still serialize and deserialize
+        // for legacy compatibility sake
+        len += self._unused_field_1.encode(&mut w)?;
 
         len += self.round.encode(&mut w)?;
         len += self.msgid.encode(&mut w)?;
@@ -396,7 +388,6 @@ impl Header<Unsigned> {
     /// Create an unsigned header suitable for sending to a peer
     pub fn to_peer(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         payload: &Payload,
     ) -> Header<Unsigned> {
@@ -408,7 +399,7 @@ impl Header<Unsigned> {
             signature: Unsigned,
             version: MESSAGE_VERSION,
             sender: peer::Id::default(),
-            receiver: recipient,
+            _unused_field_1: peer::Id::default(),
             round: stage.round as u32,
             msgid: msgid,
             nonce: 0, // dummy
@@ -443,7 +434,7 @@ impl Header<Unsigned> {
             signature: sc.secp.sign_ecdsa(&msghash, &sc.comm_sk),
             version: self.version,
             sender: self.sender,
-            receiver: self.receiver,
+            _unused_field_1: self._unused_field_1,
             round: self.round,
             msgid: self.msgid,
             nonce: self.nonce,
@@ -462,7 +453,7 @@ impl Header<secp256k1::ecdsa::Signature> {
             signature: Validated,
             version: self.version,
             sender: self.sender,
-            receiver: self.receiver,
+            _unused_field_1: self._unused_field_1,
             round: self.round,
             msgid: self.msgid,
             nonce: self.nonce,
@@ -487,9 +478,7 @@ impl NetEncodable for Header<secp256k1::ecdsa::Signature> {
         let version = NetEncodable::decode(&mut r)?;
         let sender = NetEncodable::decode(&mut r)?;
 
-        // read rollouts docs for comment on receiver field
-        let _ = common::rollouts::Broadcast::Phase3;
-        let receiver = NetEncodable::decode(&mut r)?;
+        let _unused_field_1: peer::Id = NetEncodable::decode(&mut r)?;
 
         let round = NetEncodable::decode(&mut r)?;
         let msgid = NetEncodable::decode(&mut r)?;
@@ -503,7 +492,7 @@ impl NetEncodable for Header<secp256k1::ecdsa::Signature> {
             signature: signature,
             version: version,
             sender: sender,
-            receiver: receiver,
+            _unused_field_1: _unused_field_1,
             round: round,
             msgid: msgid,
             nonce: nonce,
@@ -623,8 +612,6 @@ pub enum Payload {
         /// A free-form message
         message: String
     },
-    /// An ACK to the Status message, used to confirm network connectivity
-    StatusAck,
     /// An unsigned sidechain block (from master to peer)
     UnsignedBlock {
         /// The data
@@ -673,7 +660,6 @@ impl Payload {
             Payload::StatusBlocksigner { .. } => Command::StatusBlocksigner,
             Payload::StatusWatchmanPreSeen { .. } => Command::StatusWatchmanPreSeen,
             Payload::StatusWatchman { .. } => Command::StatusWatchman,
-            Payload::StatusAck => Command::StatusAck,
             Payload::UnsignedBlock { .. } => Command::UnsignedBlock,
             Payload::BlockPrecommit { .. } => Command::BlockPrecommit,
             Payload::BlockSignature { .. } => Command::BlockSignature,
@@ -789,10 +775,6 @@ impl Payload {
                 len += peers_seen.encode(&mut w)?;
                 w.write_all(message.as_bytes())?;
                 len += message.len();
-            },
-            Payload::StatusAck => {
-                // Remove the StatusAck type when cleaning up this rollout
-                let _ = common::rollouts::StatusAckElim::Phase3;
             },
             Payload::UnsignedBlock { ref block } => {
                 len += elements::encode::Encodable::consensus_encode(block, &mut w)?;
@@ -921,7 +903,6 @@ impl NetEncodable for Message<secp256k1::ecdsa::Signature> {
                     s
                 },
             },
-            Command::StatusAck => Payload::StatusAck,
             Command::UnsignedBlock => Payload::UnsignedBlock {
                 block: elements::encode::Decodable::consensus_decode(&mut cursor)?,
             },
@@ -975,12 +956,11 @@ impl Message<Unsigned> {
     /// Helper to create an unsigned message from a payload and context
     fn from_payload(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         payload: Payload,
     ) -> Message<Unsigned> {
         Message {
-            header: Header::to_peer(stage, recipient, msgid, &payload),
+            header: Header::to_peer(stage, msgid, &payload),
             payload: payload,
         }
     }
@@ -998,7 +978,6 @@ impl Message<Unsigned> {
     /// Create a new blocksigner status message
     pub fn status_blocksigner_pre_seen(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         peer_keys: Vec<(peer::Id, PublicKey, PublicKey)>,
         dynafed_params: Vec<elements::dynafed::Params>,
@@ -1013,13 +992,12 @@ impl Message<Unsigned> {
             round_count,
             message,
         };
-        Message::from_payload(stage, recipient, msgid, payload)
+        Message::from_payload(stage, msgid, payload)
     }
 
     /// Create a new blocksigner status message
     pub fn status_blocksigner(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         peer_keys: Vec<(peer::Id, PublicKey, PublicKey)>,
         dynafed_params: Vec<elements::dynafed::Params>,
@@ -1036,13 +1014,12 @@ impl Message<Unsigned> {
             peers_seen,
             message,
         };
-        Message::from_payload(stage, recipient, msgid, payload)
+        Message::from_payload(stage, msgid, payload)
     }
 
     /// Create a new watchman status message
     pub fn status_watchman_pre_seen(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         peer_keys: Vec<(peer::Id, PublicKey, PublicKey)>,
         mainchain_hash: bitcoin::BlockHash,
@@ -1075,13 +1052,12 @@ impl Message<Unsigned> {
             pending_change_value: pending_change_value,
             message: message,
         };
-        Message::from_payload(stage, recipient, msgid, payload)
+        Message::from_payload(stage, msgid, payload)
     }
 
     /// Create a new watchman status message
     pub fn status_watchman(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         peer_keys: Vec<(peer::Id, PublicKey, PublicKey)>,
         mainchain_hash: bitcoin::BlockHash,
@@ -1116,87 +1092,71 @@ impl Message<Unsigned> {
             peers_seen,
             message: message,
         };
-        Message::from_payload(stage, recipient, msgid, payload)
-    }
-
-    /// Create a new status-ACK message
-    pub fn status_ack(
-        stage: RoundStage,
-        recipient: peer::Id,
-        msgid: u32,
-    ) -> Message<Unsigned> {
-        Message::from_payload(stage, recipient, msgid, Payload::StatusAck)
+        Message::from_payload(stage, msgid, payload)
     }
 
     /// Create a new unsigned block
     pub fn unsigned_block(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         block: elements::Block,
     ) -> Message<Unsigned> {
-        Message::from_payload(stage, recipient, msgid, Payload::UnsignedBlock { block })
+        Message::from_payload(stage, msgid, Payload::UnsignedBlock { block })
     }
 
     /// Create a new block precommit message
     pub fn block_precommit(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         blockhash: elements::BlockHash,
     ) -> Message<Unsigned> {
-        Message::from_payload(stage, recipient, msgid, Payload::BlockPrecommit { blockhash })
+        Message::from_payload(stage, msgid, Payload::BlockPrecommit { blockhash })
     }
 
     /// Create a new block signature message
     pub fn block_signature(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         blockhash: elements::BlockHash,
         signature: secp256k1::ecdsa::Signature,
     ) -> Message<Unsigned> {
         let payload = Payload::BlockSignature { blockhash, signature };
-        Message::from_payload(stage, recipient, msgid, payload)
+        Message::from_payload(stage, msgid, payload)
     }
 
     /// Create a new tx-proposal message
     pub fn tx_proposal(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         proposal: transaction::ConcreteProposal,
     ) -> Message<Unsigned> {
-        Message::from_payload(stage, recipient, msgid, Payload::TxProposal { proposal })
+        Message::from_payload(stage, msgid, Payload::TxProposal { proposal })
     }
 
     /// Create a new tx precommit message
     pub fn tx_precommit(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         txid: bitcoin::Txid,
     ) -> Message<Unsigned> {
-        Message::from_payload(stage, recipient, msgid, Payload::TxPrecommit { txid })
+        Message::from_payload(stage, msgid, Payload::TxPrecommit { txid })
     }
 
     /// Create a new tx-signatures message
     pub fn tx_signatures(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
         sigs: transaction::TransactionSignatures,
     ) -> Message<Unsigned> {
-        Message::from_payload(stage, recipient, msgid, Payload::TxSignatures { sigs })
+        Message::from_payload(stage, msgid, Payload::TxSignatures { sigs })
     }
 
     /// Create a new idle message
     pub fn idle(
         stage: RoundStage,
-        recipient: peer::Id,
         msgid: u32,
     ) -> Message<Unsigned> {
-        Message::from_payload(stage, recipient, msgid, Payload::Idle)
+        Message::from_payload(stage, msgid, Payload::Idle)
     }
 }
 
@@ -1212,12 +1172,6 @@ impl Message<secp256k1::ecdsa::Signature> {
             Some(p) => p,
             None => return Err(Error::UnknownPeerId(self.header.sender)),
         };
-        if ROLLOUTS.broadcast != common::rollouts::Broadcast::Phase3 {
-            let rcvr = self.header.receiver;
-            if rcvr != peer::Id::ZERO && peers.by_id(rcvr).is_none() {
-                return Err(Error::UnknownPeerId(self.header.receiver));
-            }
-        }
 
         // Check signature
         let mut engine = sha256d::Hash::engine();
@@ -1242,6 +1196,12 @@ impl Message<secp256k1::ecdsa::Signature> {
                 payload_hash
             );
             return Err(Error::BadMessageHash);
+        }
+
+        // Check if the legacy Receiver field is zeroed as it is now unused.
+        // If the field is non-zero we will issue this Warn log
+        if self.header._unused_field_1 != peer::Id::ZERO {
+            log!(Warn, "Non-zero data in `_unused_field_1`: {:?}", self);
         }
 
         Ok(())
@@ -1803,7 +1763,6 @@ impl NetEncodable for (peer::Id, PublicKey, PublicKey) {
 pub mod tests {
     use bitcoin::secp256k1::ecdsa::Signature;
     use std::str::FromStr;
-
     use utils::empty_elements_block;
     use super::*;
 
@@ -2030,6 +1989,7 @@ pub mod tests {
                 assert_eq!(deser.header.version, MESSAGE_VERSION);
                 assert_eq!(deser.header.length as usize, payload_len);
                 assert_eq!(deser.header.hash, payload_hash);
+
             }
         }
     }
@@ -2052,7 +2012,6 @@ pub mod tests {
     message_roundtrip_test!(status_watchman_ps_rtt, CONST_STATUS_WATCHMAN_PRE_SEEN, Command::StatusWatchmanPreSeen);
     message_roundtrip_test!(status_watchman_rtt, CONST_STATUS_WATCHMAN, Command::StatusWatchman);
     message_roundtrip_test!(block_signature_rtt, CONST_BLOCK_SIGNATURE, Command::BlockSignature);
-    message_roundtrip_test!(status_ack_rtt, CONST_STATUS_ACK, Command::StatusAck);
     message_roundtrip_test!(idle_rtt, CONST_IDLE, Command::Idle);
     message_roundtrip_test!(unsigned_block_rtt, CONST_UNSIGNED_BLOCK, Command::UnsignedBlock);
 
@@ -2095,15 +2054,7 @@ pub mod tests {
 
     #[test]
     fn idle_round_trip() {
-        check_message!(you, Message::idle(RoundStage::test_dummy(), you, 101));
-    }
-
-    #[test]
-    fn status_ack_round_trip() {
-        check_message!(
-            you,
-            Message::status_ack(RoundStage::test_dummy(), you, 101)
-        );
+        check_message!(you, Message::idle(RoundStage::test_dummy(), 101));
     }
 
     #[test]
@@ -2112,7 +2063,6 @@ pub mod tests {
             you,
             Message::unsigned_block(
                 RoundStage::test_dummy(),
-                you,
                 101, // msgid
                 empty_elements_block(),
             )
@@ -2125,7 +2075,6 @@ pub mod tests {
             you,
             Message::block_precommit(
                 RoundStage::test_dummy(),
-                you,
                 101, // msgid
                 elements::BlockHash::hash(b"block_precommit"),
             )
@@ -2138,7 +2087,6 @@ pub mod tests {
             you,
             Message::tx_signatures(
                 RoundStage::test_dummy(),
-                you,
                 101, // msgid
                 transaction::TransactionSignatures::from(vec![
                     (
@@ -2172,7 +2120,6 @@ pub mod tests {
             you,
             Message::block_signature(
                 RoundStage::test_dummy(),
-                you,
                 101, // msgid
                 elements::BlockHash::hash(b"block hash"),
                 Signature::from_str("\
@@ -2210,7 +2157,7 @@ pub mod tests {
         };
         check_message!(
             you,
-            Message::tx_proposal(RoundStage::test_dummy(), you, 101, proposal)
+            Message::tx_proposal(RoundStage::test_dummy(), 101, proposal)
         );
     }
 
@@ -2220,7 +2167,6 @@ pub mod tests {
             you,
             Message::status_blocksigner_pre_seen(
                 RoundStage::test_dummy(),
-                you,
                 101, // msgid
                 vec![
                     (
@@ -2239,7 +2185,6 @@ pub mod tests {
             you,
             Message::status_blocksigner(
                 RoundStage::test_dummy(),
-                you,
                 101, // msgid
                 vec![
                     (
@@ -2263,7 +2208,6 @@ pub mod tests {
             you,
             Message::status_watchman_pre_seen(
                 RoundStage::test_dummy(),
-                you,
                 101, // msgid
                 vec![
                     (
@@ -2295,7 +2239,6 @@ pub mod tests {
             you,
             Message::status_watchman(
                 RoundStage::test_dummy(),
-                you,
                 101, // msgid
                 vec![
                     (

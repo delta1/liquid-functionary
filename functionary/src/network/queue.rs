@@ -256,7 +256,7 @@ mod tests {
         msgid: u32,
         nonce: u32,
     ) -> message::Message<message::Validated> {
-        let mut msg_ser = message::tests::CONST_STATUS_ACK.clone();
+        let mut msg_ser = message::tests::CONST_BLOCK_PRECOMMIT.clone();
         assert_eq!(
             message::MESSAGE_VERSION,
             21,
@@ -270,7 +270,7 @@ mod tests {
         message::NetEncodable::encode(&nonce, &mut msg_ser[88..92]).unwrap();
 
         let msg: message::Message<secp256k1::ecdsa::Signature> = message::NetEncodable::decode(&msg_ser[..])
-            .expect("decoding dummy statusack for msg queue unit tests");
+            .expect("decoding dummy BLOCK_PRECOMMIT for msg queue unit tests");
         msg.drop_signature()
     }
 
